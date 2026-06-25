@@ -80,12 +80,7 @@ export default function WaiterClearing() {
       const response = await apiClient.get('/api/admin/uncleared-staff');
       if (!response.ok) throw new Error('Failed to fetch uncleared staff summary');
       const data = await response.json();
-      const normalizedData = data.map((item: UnclearedStaff) => ({
-        ...item,
-        uncleared_count: Number(item.uncleared_count),
-        total_due: Number(item.total_due),
-      }));
-      setUnclearedStaff(normalizedData);
+      setUnclearedStaff(data);
     } catch (err: any) {
       console.error(err);
       setError('Could not load uncleared staff summary');
@@ -357,7 +352,7 @@ export default function WaiterClearing() {
                     </div>
                   </div>
                   <div className="text-right">
-                    <div className="text-sm font-bold text-gray-900">{formatCurrency(Number(s.total_due))}</div>
+                    <div className="text-sm font-bold text-gray-900">{formatCurrency(s.total_due)}</div>
                     <div className="text-xs text-gray-500">{s.uncleared_count} receipts</div>
                   </div>
                 </div>
@@ -435,7 +430,7 @@ export default function WaiterClearing() {
                       {s.uncleared_count} receipts
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm font-bold text-gray-900">
-                      {formatCurrency(Number(s.total_due))}
+                      {formatCurrency(s.total_due)}
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-2">
                       <button
@@ -513,7 +508,7 @@ export default function WaiterClearing() {
               
               <div className="flex justify-between items-center text-sm">
                 <span className="text-gray-500">Total Net to Settle:</span>
-                <span className="text-base font-black text-red-600">{formatCurrency(Number(confirmClearingStaff.total_due))}</span>
+                <span className="text-base font-black text-red-600">{formatCurrency(confirmClearingStaff.total_due)}</span>
               </div>
             </div>
             
@@ -690,7 +685,7 @@ export default function WaiterClearing() {
             <div className="px-4 py-3 sm:px-6 sm:py-4 border-t bg-gray-50 rounded-b-xl flex flex-col sm:flex-row justify-between items-center gap-4">
               <div className="text-gray-700 w-full sm:w-auto text-center sm:text-left">
                 <span className="text-xs sm:text-sm">Total Due:</span>
-                <span className="ml-2 text-base sm:text-lg font-bold">{formatCurrency(Number(selectedStaff?.total_due || 0))}</span>
+                <span className="ml-2 text-base sm:text-lg font-bold">{formatCurrency(selectedStaff?.total_due || 0)}</span>
               </div>
               <button
                 onClick={() => setShowModal(false)}
