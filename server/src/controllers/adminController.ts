@@ -51,7 +51,7 @@ export const getUserSessions = async (req: Request, res: Response) => {
       )
       .where('us.login_time', '>', new Date(Date.now() - 24 * 60 * 60 * 1000)) // Last 24 hours
       .whereIn('us.id', function() {
-        this.select(db.raw('MAX(id)'))
+        this.select(db.raw('MAX(id) AS id'))
           .from('user_sessions')
           .where('login_time', '>', new Date(Date.now() - 24 * 60 * 60 * 1000))
           .groupBy('user_id');
@@ -126,59 +126,37 @@ export const clearPreviousData = async (req: Request, res: Response) => {
     }
 
     // Safety guard: caller must explicitly pass { confirm: true } in the body.
+    // This prevents automated calls (e.g. dashboard load side-effects) from
+    // triggering a bulk rollover and making balances appear to reset at midnight.
     if (req.body?.confirm !== true) {
       return res.status(400).json({ message: 'Explicit confirmation required. Pass { "confirm": true } in the request body.' });
     }
 
-    // Kenyan 8 AM Rollover Logic (8 AM EAT = 11 AM UTC)
+    // Kenyan 8 AM Rollover Logic (8 AM EAT = 5 AM UTC)
     const anchorUTC = new Date();
-    anchorUTC.setUTCHours(11, 0, 0, 0);
+    anchorUTC.setUTCHours(5, 0, 0, 0);
     
     // If current time is before 8 AM EAT, the previous shift work window ended at yesterday's 8 AM anchor.
     if (new Date() < anchorUTC) {
       anchorUTC.setUTCDate(anchorUTC.getUTCDate() - 1);
     }
 
-    // Runtime Safety: Check if completed_by column exists inside the table schema
-    const hasCompletedBy = await db.schema.hasColumn('orders', 'completed_by');
-
     await db.transaction(async (trx) => {
       // Record clearance for each unique staff member who has uncleared data created BEFORE the 8 AM cutoff
-      // Safely toggle completed_by sub-selection inside the union subquery based on runtime schema state
-      const orderSelectionSQL = hasCompletedBy
-        ? 'SELECT staff_id FROM orders WHERE is_cleared = false AND created_at < ? UNION SELECT completed_by as staff_id FROM orders WHERE is_cleared = false AND created_at < ?'
-        : 'SELECT staff_id FROM orders WHERE is_cleared = false AND created_at < ?';
-
-      const rawBindings = hasCompletedBy
-        ? [anchorUTC, anchorUTC, anchorUTC, anchorUTC, anchorUTC]
-        : [anchorUTC, anchorUTC, anchorUTC];
-
       const staffWithUnclearedData = await trx.raw(`
         SELECT staff_id FROM (
-          ${orderSelectionSQL}
+          SELECT staff_id FROM orders WHERE is_cleared = false AND created_at < ?
           UNION
           SELECT created_by as staff_id FROM expenses WHERE is_cleared = false AND created_at < ?
           UNION
           SELECT staff_id FROM room_transactions WHERE is_cleared = false AND created_at < ?
         ) as combined WHERE staff_id IS NOT NULL GROUP BY staff_id
-      `, rawBindings);
+      `, [anchorUTC, anchorUTC, anchorUTC]);
 
       const targetStaff = staffWithUnclearedData.rows || staffWithUnclearedData;
 
       for (const { staff_id } of targetStaff) {
-        const orderSum = await trx('orders')
-          .where({ is_cleared: false })
-          .andWhere('created_at', '<', anchorUTC)
-          .where(function() {
-            if (hasCompletedBy) {
-              this.where('staff_id', staff_id).orWhere('completed_by', staff_id);
-            } else {
-              this.where('staff_id', staff_id);
-            }
-          })
-          .sum('total_amount as total')
-          .first();
-
+        const orderSum = await trx('orders').where({ staff_id, is_cleared: false }).andWhere('created_at', '<', anchorUTC).sum('total_amount as total').first();
         const roomSum = await trx('room_transactions').where({ staff_id, is_cleared: false }).andWhere('created_at', '<', anchorUTC).sum('total_amount as total').first();
         const expenseSum = await trx('expenses').where({ created_by: staff_id, is_cleared: false }).andWhere('created_at', '<', anchorUTC).sum('amount as total').first();
 
@@ -193,7 +171,7 @@ export const clearPreviousData = async (req: Request, res: Response) => {
         });
       }
 
-      // Clear orders older than the 8 AM rollover point matching either order-ownership field
+      // Clear orders older than the 8 AM rollover point
       await trx('orders')
         .where('is_cleared', false)
         .andWhere('created_at', '<', anchorUTC)
@@ -243,35 +221,26 @@ export const clearStaffData = async (req: Request, res: Response) => {
       return res.status(403).json({ message: 'Access denied: Only Admins or Managers can execute waiter clearances.' });
     }
 
-    // Runtime Safety: Check if completed_by exists before compiling subqueries
-    const hasCompletedBy = await db.schema.hasColumn('orders', 'completed_by');
-
     const result = await db.transaction(async (trx) => {
-      // Calculate active running balance
+      // 1. Calculate the active balance — all active statuses, matching the summary query.
+      // NOTE: 'completed_by' does not exist on orders — filter by staff_id only.
       const orderSum = await trx('orders')
         .where('is_cleared', false)
-        .where('status', 'completed')
-        .where(function() {
-          if (hasCompletedBy) {
-            this.where('staff_id', staffIdToClear).orWhere('completed_by', staffIdToClear);
-          } else {
-            this.where('staff_id', staffIdToClear);
-          }
-        })
+        .whereIn('status', ['pending', 'preparing', 'ready', 'completed'])
+        .where('staff_id', staffIdToClear)
         .sum('total_amount as total').first();
-
       const roomSum = await trx('room_transactions').where({ staff_id: staffIdToClear, is_cleared: false }).sum('total_amount as total').first();
       const expenseSum = await trx('expenses').where({ created_by: staffIdToClear, is_cleared: false }).sum('amount as total').first();
 
       const totalNet = (Number(orderSum?.total) || 0) + (Number(roomSum?.total) || 0) - (Number(expenseSum?.total) || 0);
 
-      // Get staff name
+      // 2. Get staff name
       const staff = await trx('staff')
         .where('id', staffIdToClear)
         .select('name')
         .first();
 
-      // Record entry inside clearance trace logs
+      // 3. Record entry inside log
       await trx('waiter_clearances').insert({
         staff_id: staffIdToClear,
         cleared_by: adminId,
@@ -280,17 +249,12 @@ export const clearStaffData = async (req: Request, res: Response) => {
         notes: `Individual clearance for ${staff?.name || 'staff'} completed by Admin`
       });
 
-      // Update all matching completed orders to true
+      // 4. Update all uncleared records to cleared — same status set as summary query.
+      // NOTE: 'completed_by' does not exist on orders — filter by staff_id only.
       await trx('orders')
         .where('is_cleared', false)
-        .where('status', 'completed')
-        .where(function() {
-          if (hasCompletedBy) {
-            this.where('staff_id', staffIdToClear).orWhere('completed_by', staffIdToClear);
-          } else {
-            this.where('staff_id', staffIdToClear);
-          }
-        })
+        .whereIn('status', ['pending', 'preparing', 'ready', 'completed'])
+        .where('staff_id', staffIdToClear)
         .update({
           is_cleared: true,
           cleared_at: new Date(),
@@ -338,42 +302,32 @@ export const getUnclearedStaffReceipts = async (req: Request, res: Response) => 
     const { id: staffId } = req.params;
     const { start, end, includeCleared } = req.query;
     const currentUser = (req as any).user;
-    const staffIdInt = parseInt(staffId, 10);
 
-    if (Number.isNaN(staffIdInt)) {
-      return res.status(400).json({ message: 'Invalid staff id' });
+    if (!currentUser) {
+      return res.status(401).json({ message: 'Unauthorized' });
     }
 
     // Waiters can ONLY see their own receipts
-    if (currentUser.role === 'waiter' && currentUser.id !== staffIdInt) {
+    // parseInt both sides — req.params values are strings; currentUser.id may be a number
+    if (currentUser.role === 'waiter' && currentUser.id !== parseInt(staffId, 10)) {
       return res.status(403).json({ message: 'Access denied: You can only view your own receipts' });
     }
 
-    // Runtime Safety mapping token
-    const hasCompletedBy = await db.schema.hasColumn('orders', 'completed_by');
-
-    // 1. Get Orders matching either standard staff allocation or completed token if column exists
-    let ordersQuery = db('orders');
-    if (hasCompletedBy) {
-      ordersQuery = ordersQuery.where(function() {
-        this.where('staff_id', staffIdInt).orWhere('completed_by', staffIdInt);
-      });
-    } else {
-      ordersQuery = ordersQuery.where('staff_id', staffIdInt);
-    }
-
+    // 1. Get Orders
+    let ordersQuery = db('orders').where('staff_id', staffId);
     if (includeCleared === 'true') {
       ordersQuery = ordersQuery.where('is_cleared', true);
       if (start && end) {
         ordersQuery = ordersQuery.whereBetween('created_at', [start as string, end as string]);
       }
     } else {
+      // For active clearing, ignore date range and pull ALL uncleared transactions
       ordersQuery = ordersQuery.where('is_cleared', false);
     }
     const orders = await ordersQuery.select('*').orderBy('created_at', 'desc');
 
     // 2. Get Expenses (formatted as pseudo-receipts)
-    let expensesQuery = db('expenses').where('created_by', staffIdInt);
+    let expensesQuery = db('expenses').where('created_by', staffId);
     if (includeCleared === 'true') {
       expensesQuery = expensesQuery.where('is_cleared', true);
       if (start && end) {
@@ -385,7 +339,7 @@ export const getUnclearedStaffReceipts = async (req: Request, res: Response) => 
     const expenses = await expensesQuery.select('*').orderBy('created_at', 'desc');
 
     // 3. Get Room Transactions (formatted as pseudo-receipts)
-    let roomsQuery = db('room_transactions').where('staff_id', staffIdInt);
+    let roomsQuery = db('room_transactions').where('staff_id', staffId);
     if (includeCleared === 'true') {
       roomsQuery = roomsQuery.where('is_cleared', true);
       if (start && end) {
@@ -397,10 +351,10 @@ export const getUnclearedStaffReceipts = async (req: Request, res: Response) => 
     const rooms = await roomsQuery.select('*').orderBy('created_at', 'desc');
 
     // Map everything to a consistent format for the frontend
-    const orderReceipts = orders.map(o => ({ ...o, items: [] }));
+    const orderReceipts = orders.map(o => ({ ...o, items: [] })); // Items added later
     
     const expenseReceipts = expenses.map(e => ({
-      id: -e.id,
+      id: -e.id, // Negative ID to avoid collision with orders
       order_number: `EXP-${e.receipt_number || e.id}`,
       order_type: 'expense',
       total_amount: e.amount,
@@ -418,7 +372,7 @@ export const getUnclearedStaffReceipts = async (req: Request, res: Response) => 
     }));
 
     const roomReceipts = rooms.map(r => ({
-      id: -(r.id + 1000000),
+      id: -(r.id + 1000000), // Avoid collision
       order_number: `ROOM-${r.id}`,
       order_type: 'room_service',
       total_amount: r.total_amount || r.total_price || 0,
@@ -435,8 +389,10 @@ export const getUnclearedStaffReceipts = async (req: Request, res: Response) => 
       }]
     }));
 
-    // Combine all datasets
+    // Combine all
     let allReceipts = [...orderReceipts, ...expenseReceipts, ...roomReceipts];
+    
+    // Sort by date
     allReceipts.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
 
     if (allReceipts.length === 0) {
@@ -460,7 +416,7 @@ export const getUnclearedStaffReceipts = async (req: Request, res: Response) => 
         return acc;
       }, {});
 
-      // Inject compiled items back into order shells
+      // Update the items for actual orders in allReceipts
       allReceipts = allReceipts.map(receipt => {
         if (receipt.id > 0) {
           return { ...receipt, items: itemsByOrder[receipt.id] || [] };
@@ -591,66 +547,78 @@ export const getUnclearedStaffSummary = async (req: Request, res: Response) => {
   try {
     const currentUser = (req as any).user;
 
-    // Runtime Check: Verify if completed_by column exists before using it inside the raw Knex COALESCE string
-    const hasCompletedBy = await db.schema.hasColumn('orders', 'completed_by');
-    const orderIdSelection = hasCompletedBy ? 'COALESCE(staff_id, completed_by) as staff_id' : 'staff_id';
+    // Guard: auth middleware must have attached a user
+    if (!currentUser) {
+      return res.status(401).json({ message: 'Unauthorized' });
+    }
 
-    // Build structured derived subquery table
-    const combinedTransactions = db('orders')
-      .where('is_cleared', false)
-      .where('status', 'completed')
-      .select(
-        db.raw(orderIdSelection),
-        'total_amount',
-        db.raw("'order' as type")
-      )
-      .unionAll([
-        db('expenses')
-          .where('is_cleared', false)
-          .select('created_by as staff_id', db.raw('(amount * -1) as total_amount'), db.raw("'expense' as type")),
-        db('room_transactions')
-          .where('is_cleared', false)
-          .select('staff_id', 'total_amount', db.raw("'room' as type"))
-      ])
-      .as('u');
-    
-    // Join staff table with the combined transactions to ensure all waiters appear
+    // Build the combined transactions subquery using db.raw for the derived table.
+    // Using raw SQL here avoids a Knex bug where .unionAll([...]).as('u') does not
+    // always wrap the union in parentheses, producing invalid SQL on PostgreSQL.
+    // IMPORTANT: Include ALL active statuses so orders appear on the clearing modal
+    // the moment a receipt is opened — not just after kitchen marks them completed.
+    // NOTE: 'completed_by' column does not exist on orders — use staff_id directly.
+    const combinedTransactions = db.raw(`
+      (
+        SELECT staff_id,
+               total_amount,
+               'order' AS type
+        FROM orders
+        WHERE is_cleared = false
+          AND status IN ('pending', 'preparing', 'ready', 'completed')
+          AND staff_id IS NOT NULL
+
+        UNION ALL
+
+        SELECT created_by AS staff_id,
+               (amount * -1) AS total_amount,
+               'expense' AS type
+        FROM expenses
+        WHERE is_cleared = false
+
+        UNION ALL
+
+        SELECT staff_id,
+               total_amount,
+               'room' AS type
+        FROM room_transactions
+        WHERE is_cleared = false
+      ) AS u
+    `);
+
+    // Join staff with the combined transactions so every active waiter appears,
+    // even those with a zero balance.
     const staffSummary = await db('staff as s')
       .leftJoin(combinedTransactions, 's.id', 'u.staff_id')
       .select(
-        's.id', 
-        's.name', 
-        's.employee_id', 
+        's.id',
+        's.name',
+        's.employee_id',
         's.role',
-        db.raw('CAST(COUNT(u.type) AS INTEGER) as uncleared_count'), // Count actual records, not staff rows
-        db.raw('CAST(SUM(COALESCE(u.total_amount, 0)) AS DOUBLE PRECISION) as total_due')
+        db.raw('COUNT(u.type) as uncleared_count'),
+        db.raw('SUM(COALESCE(u.total_amount, 0)) as total_due')
       )
-      .where(function() {
-        // Always show all active waiters
-        this.where(function() {
+      .where(function () {
+        // Always include all active waiters
+        this.where(function () {
           this.where('s.role', 'waiter').andWhere('s.is_active', true);
         });
-        
-        // plus any other staff member (active or not) that happens to have uncleared data
+
+        // For non-waiters also surface any staff who have uncleared data
         if (currentUser.role !== 'waiter') {
-          this.orWhereNotNull('u.staff_id'); 
+          this.orWhereNotNull('u.staff_id');
         }
       })
-      .modify((queryBuilder) => {
+      .modify((qb) => {
+        // Waiters only see their own row
         if (currentUser.role === 'waiter') {
-          queryBuilder.where('s.id', currentUser.id);
+          qb.where('s.id', currentUser.id);
         }
       })
       .groupBy('s.id', 's.name', 's.employee_id', 's.role')
       .orderBy('s.name', 'asc');
 
-    const normalizedSummary = staffSummary.map((staff) => ({
-      ...staff,
-      uncleared_count: Number(staff.uncleared_count),
-      total_due: Number(staff.total_due),
-    }));
-
-    res.json(normalizedSummary);
+    res.json(staffSummary);
   } catch (error: any) {
     console.error('Get uncleared staff summary error:', error);
     res.status(500).json({ message: 'Failed to fetch staff summary', error: error.message });

@@ -64,25 +64,40 @@ export const createOrder = async (req: Request, res: Response) => {
       }
     }
 
-    // New Receipt Numbering System: ORD-YYYYMMDD-XXXX
+    // New Receipt Numbering System: MH-YYYYMMDD-XXXX
     const today = new Date();
     const dateStr = today.toISOString().split('T')[0].replace(/-/g, ''); // YYYYMMDD
-    
-    // Start of today
-    const startOfToday = new Date();
-    startOfToday.setHours(0, 0, 0, 0);
+    const orderPrefix = `MH-${dateStr}-`;
 
-    // Count existing orders from today to generate the sequential part
-    const countResult = await db('orders')
-      .where('created_at', '>=', startOfToday)
-      .count('* as count')
+    // Derive the next sequence from the highest order_number used today.
+    // Using MAX instead of COUNT means:
+    //  - Cleared orders still anchor the sequence (no resets after cash-up)
+    //  - A gap in the middle (cancelled order) doesn't cause a collision
+    //  - Concurrent inserts are safe: both read MAX, one wins the unique constraint,
+    //    the other retries — see the retry loop below.
+    const maxResult = await db('orders')
+      .where('order_number', 'like', `${orderPrefix}%`)
+      .max('order_number as max_order_number')
       .first();
-      
-    const sequence = (parseInt(countResult?.count as string) || 0) + 1;
+
+    let sequence = 1;
+    if (maxResult?.max_order_number) {
+      const lastSeq = parseInt((maxResult.max_order_number as string).split('-')[2], 10);
+      if (!isNaN(lastSeq)) sequence = lastSeq + 1;
+    }
+
     const paddedSequence = sequence.toString().padStart(4, '0');
-    const orderNumber = `MH-${dateStr}-${paddedSequence}`;
+    let orderNumber = `${orderPrefix}${paddedSequence}`;
 
     let orderId: any;
+
+    // Retry loop: handles the rare race condition where two requests read the same
+    // MAX order_number concurrently and both try to insert the same order_number.
+    // On a unique-constraint violation (pg error code 23505) we re-derive the next
+    // sequence and try once more. Two retries are more than enough in practice.
+    const MAX_RETRIES = 3;
+    for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+      try {
 
     // Start DB transaction
     await db.transaction(async trx => {
@@ -271,13 +286,45 @@ export const createOrder = async (req: Request, res: Response) => {
       staff_name: staffName,
     });
 
+    return; // success — exit retry loop
+
+      } catch (err) {
+        // On duplicate order_number, re-derive and retry
+        const pgErr = err as any;
+        if (pgErr?.code === '23505' && pgErr?.constraint === 'orders_order_number_key' && attempt < MAX_RETRIES) {
+          console.warn(`⚠️ Duplicate order_number collision on attempt ${attempt}, retrying...`);
+
+          // Re-derive the next available sequence before next attempt
+          const retryMax = await db('orders')
+            .where('order_number', 'like', `${orderPrefix}%`)
+            .max('order_number as max_order_number')
+            .first();
+
+          let retrySeq = 1;
+          if (retryMax?.max_order_number) {
+            const last = parseInt((retryMax.max_order_number as string).split('-')[2], 10);
+            if (!isNaN(last)) retrySeq = last + 1;
+          }
+          orderNumber = `${orderPrefix}${retrySeq.toString().padStart(4, '0')}`;
+          continue; // retry
+        }
+
+        // Any other error — surface it
+        console.error('Order creation error:', err);
+        console.error('Error details:', {
+          message: (err as Error).message,
+          stack: (err as Error).stack,
+          name: (err as Error).name
+        });
+        return res.status(500).json({ 
+          message: 'Failed to create order',
+          error: (err as Error).message 
+        });
+      }
+    } // end retry loop
+
   } catch (err) {
-    console.error('Order creation error:', err);
-    console.error('Error details:', {
-      message: (err as Error).message,
-      stack: (err as Error).stack,
-      name: (err as Error).name
-    });
+    console.error('Order creation error (outer):', err);
     res.status(500).json({ 
       message: 'Failed to create order',
       error: (err as Error).message 

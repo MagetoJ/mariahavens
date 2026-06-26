@@ -31,7 +31,28 @@ export default function ReceiptModal({ receiptData, onClose }: ReceiptModalProps
 
   useEffect(() => {
     fetchSettings();
+    // Mark order as completed (recorded as a sale) as soon as the receipt modal
+    // appears — this ensures it shows up on the admin clearing modal immediately,
+    // regardless of whether the waiter clicks Print or just closes the modal.
+    markOrderAsCompletedOnMount();
   }, []);
+
+  const markOrderAsCompletedOnMount = async () => {
+    if (!receiptData.orderId) return;
+    try {
+      const token = localStorage.getItem('pos_token');
+      await fetch(`http://localhost:3000/api/orders/${receiptData.orderId}/complete-for-print`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': token ? `Bearer ${token}` : ''
+        }
+      });
+      console.log('✅ Order recorded as sale on receipt modal open');
+    } catch (error) {
+      console.error('Error recording sale on receipt open:', error);
+    }
+  };
 
   const fetchSettings = async () => {
     try {
@@ -89,26 +110,8 @@ export default function ReceiptModal({ receiptData, onClose }: ReceiptModalProps
   };
 
   const handlePrint = async () => {
-    try {
-      if (receiptData.orderId) {
-        const token = localStorage.getItem('pos_token');
-        const response = await fetch(`http://localhost:3000/api/orders/${receiptData.orderId}/complete-for-print`, {
-          method: 'PUT',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': token ? `Bearer ${token}` : ''
-          }
-        });
-
-        if (response.ok) {
-          console.log('✅ Order marked as completed for receipt printing');
-        } else {
-          console.warn('⚠️ Could not mark order as completed, proceeding with print');
-        }
-      }
-    } catch (error) {
-      console.error('Error marking order as completed:', error);
-    }
+    // Order was already marked as completed when the receipt modal opened (see
+    // markOrderAsCompletedOnMount). No need to call the endpoint again here.
 
     const customerLine = receiptData.customerName ? `<div>Customer: ${receiptData.customerName}</div>` : '';
     const receiptContent = `
