@@ -19,7 +19,8 @@ export const getPublicProducts = async (req: Request, res: Response) => {
         'categories.name as category_name',
         'inventory_items.inventory_type',
         'inventory_items.current_stock',
-        'inventory_items.id as inventory_id'
+        'inventory_items.id as inventory_id',
+        'inventory_items.selling_price as inventory_selling_price'
       )
       .where('products.is_active', true)
       .where('products.is_available', true)
@@ -33,15 +34,18 @@ export const getPublicProducts = async (req: Request, res: Response) => {
       .whereNotIn('id', db('products').whereNotNull('inventory_item_id').select('inventory_item_id'));
 
     const barItemsAsProducts = barInventoryItems.map(item => {
+      const sellingPrice = parseFloat(item.selling_price || '0');
       const buyingPrice = parseFloat(item.buying_price || '0');
       const costPerUnit = parseFloat(item.cost_per_unit || '0');
-      const basePrice = buyingPrice || costPerUnit || 0;
+      
+      // Prioritize the correct inventory selling price, falling back to 50% markup if 0
+      const basePrice = sellingPrice > 0 ? sellingPrice : (buyingPrice || costPerUnit || 0) * 1.5;
 
       return {
         id: `inv-${item.id}`,
         name: item.name,
-        description: `Stock: ${item.current_stock} ${item.unit}`,
-        price: basePrice * 1.5, // 50% markup if no product price
+        description: `Stock: ${item.current_stock} ${item.unit || ''}`,
+        price: basePrice,
         category_id: 3, // Beverages/Bar category
         category_name: 'Bar',
         inventory_type: 'bar',
@@ -58,11 +62,16 @@ export const getPublicProducts = async (req: Request, res: Response) => {
         acc[categoryName] = [];
       }
       
+      // Determine correct price: default to product price, but fallback to inventory selling price if product price is 0
+      const baseProductPrice = parseFloat(product.price || '0');
+      const invSellingPrice = parseFloat(product.inventory_selling_price || '0');
+      const displayPrice = baseProductPrice > 0 ? baseProductPrice : (invSellingPrice > 0 ? invSellingPrice : baseProductPrice);
+
       const itemData: any = {
         id: product.id,
         name: product.name,
         description: product.description,
-        price: product.price,
+        price: displayPrice,
         image_url: product.image_url,
       };
 
@@ -84,6 +93,7 @@ export const getPublicProducts = async (req: Request, res: Response) => {
     res.status(500).json({ message: 'Error fetching public products' });
   }
 };
+
 // Get all products with inventory status
 export const getProducts = async (req: Request, res: Response) => {
   try {
@@ -141,7 +151,7 @@ export const createProduct = async (req: Request, res: Response) => {
       category_id,
       price,
       cost,
-      inventory_item_id, // <-- NEW
+      inventory_item_id,
       description,
       preparation_time,
       image_url,
@@ -172,7 +182,7 @@ export const createProduct = async (req: Request, res: Response) => {
         category_id,
         price,
         cost: cost || 0,
-        inventory_item_id: inventory_item_id || null, // <-- NEW
+        inventory_item_id: inventory_item_id || null,
         description: description || '',
         preparation_time: preparation_time || 0,
         image_url: image_url || null,
@@ -202,7 +212,7 @@ export const updateProduct = async (req: Request, res: Response) => {
       cost, 
       preparation_time, 
       image_url,
-      inventory_item_id // <-- NEW
+      inventory_item_id 
     } = req.body;
 
     // Check if product exists
@@ -224,7 +234,7 @@ export const updateProduct = async (req: Request, res: Response) => {
     if (image_url !== undefined) updateData.image_url = image_url;
     if (cost !== undefined) updateData.cost = cost;
     if (preparation_time !== undefined) updateData.preparation_time = preparation_time;
-    if (inventory_item_id !== undefined) updateData.inventory_item_id = inventory_item_id; // <-- NEW
+    if (inventory_item_id !== undefined) updateData.inventory_item_id = inventory_item_id;
 
     // If updating name/category_id, check for duplicates
     if (updateData.name || updateData.category_id) {
@@ -371,8 +381,6 @@ export const uploadProducts = async (req: Request, res: Response) => {
   if (!req.file) {
     return res.status(400).json({ message: 'No file uploaded' });
   }
-
-  const errors: string[] = [];
 
   try {
     const workbook = XLSX.readFile(req.file.path);

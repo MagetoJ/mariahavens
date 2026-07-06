@@ -4,11 +4,11 @@ const knexConfig = require('./knexfile');
 const db = knex(knexConfig.development || knexConfig);
 
 async function rollbackClearance() {
-  console.log('🔄 Initiating balance restoration for June 25, 2026...');
+  console.log('🔄 Initiating balance restoration for July 5, 2026...');
 
   // Operational window boundaries for June 25 (Local Kenyan Time context)
-  const startTime = new Date('2026-06-25T00:00:00');
-  const endTime = new Date('2026-06-25T23:59:59');
+  const startTime = new Date('2026-07-05T00:00:00');
+  const endTime = new Date('2026-07-05T23:59:59');
 
   try {
     await db.transaction(async (trx) => {

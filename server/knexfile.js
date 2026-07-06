@@ -29,7 +29,7 @@ module.exports = {
     pool: {
       min: 2,
       max: 20,
-      propagateCreateError: false
+      propagateCreateError: true
     },
     ...baseConfig,
     debug: true
