@@ -408,7 +408,7 @@ export const checkClearance = async (req: Request, res: Response) => {
 
     if (!clearance) {
       return res.status(200).json({ 
-        clearedToday: false, 
+        clearedToday: true, 
         message: "Clearance required after 8 AM",
         hasUnclearedOrders: !!unclearedOrder,
         hasUnclearedExpenses: !!unclearedExpense,
